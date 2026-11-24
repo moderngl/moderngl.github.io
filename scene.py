@@ -6,6 +6,7 @@ import pyodide_js
 from pyodide.ffi import create_proxy
 
 import moderngl
+import toys
 
 canvas = js.document.getElementById('canvas')
 gl = canvas.getContext('webgl2', antialias=False, depth=True, stencil=True, alpha=True)
@@ -14,99 +15,126 @@ pyodide_js._module.mergeLibSymbols(symbols)
 
 ctx = moderngl.get_context()
 
-count = 200
+toys.init()
 
-blade = []
-for i in range(7):
-    u = i / 7
-    v = math.sin(u * u * (math.pi - 1.0) + 1.0)
-    blade.append((-v * 0.03, u * u * 0.2, u))
-    blade.append((v * 0.03, u * u * 0.2, u))
-blade.append((0.0, 0.2, 1.0))
+pointer = {'x': 0.0, 'y': 0.0, 'pressed': False}
 
-ctx.shaders['grass.vert'] = '''
+
+def on_move(e):
+    pointer['x'] = e.offsetX / max(canvas.clientWidth, 1) * 2.0 - 1.0
+    pointer['y'] = 1.0 - e.offsetY / max(canvas.clientHeight, 1) * 2.0
+
+
+def on_down(e):
+    on_move(e)
+    pointer['pressed'] = True
+    canvas.setPointerCapture(e.pointerId)
+
+
+def on_up(e):
+    pointer['pressed'] = False
+
+
+listeners = [create_proxy(on_move), create_proxy(on_down), create_proxy(on_up)]
+canvas.addEventListener('pointermove', listeners[0])
+canvas.addEventListener('pointerdown', listeners[1])
+canvas.addEventListener('pointerup', listeners[2])
+canvas.addEventListener('pointercancel', listeners[2])
+
+tile = 256
+colors = ['#e63946', '#f4a261', '#e9c46a', '#2a9d8f', '#457b9d', '#8e7dbe', '#ef476f', '#06d6a0']
+painter = js.document.createElement('canvas')
+painter.width = tile
+painter.height = tile * (len(colors) + 1)
+g = painter.getContext('2d')
+g.textAlign = 'center'
+g.textBaseline = 'middle'
+g.font = f'900 {int(tile * 0.7)}px system-ui, sans-serif'
+for i, color in enumerate(colors):
+    y = i * tile
+    g.fillStyle = color
+    g.fillRect(0, y, tile, tile)
+    g.strokeStyle = 'rgba(0, 0, 0, 0.15)'
+    g.lineWidth = 16
+    g.strokeRect(8, y + 8, tile - 16, tile - 16)
+    g.fillStyle = '#ffffff'
+    g.fillText(toys.letters[i], tile / 2, y + tile * 0.54)
+
+y = len(colors) * tile
+g.fillStyle = '#141414'
+g.fillRect(0, y, tile, tile)
+g.fillStyle = '#1e1e1e'
+g.fillRect(0, y, tile / 2, tile / 2)
+g.fillRect(tile / 2, y + tile / 2, tile / 2, tile / 2)
+
+texture = ctx.texture((tile, tile), 'rgba8unorm', bytes(g.getImageData(0, 0, tile, painter.height).data.to_py()), array=len(colors) + 1, levels=0)
+texture.mipmaps()
+
+ctx.shaders['mesh.vert'] = '''
     #version 330 core
-
-    uniform int N;
-    uniform vec3 grass[15];
-
-    vec4 hash41(float p) {
-        vec4 p4 = fract(vec4(p) * vec4(0.1031, 0.1030, 0.0973, 0.1099));
-        p4 += dot(p4, p4.wzxy + 33.33);
-        return fract((p4.xxyz + p4.yzzw) * p4.zywx);
-    }
-
-    float hash11(float p) {
-        p = fract(p * 0.1031);
-        p *= p + 33.33;
-        p *= p + p;
-        return fract(p);
-    }
 
     layout (std140) uniform Common {
         mat4 camera;
     };
 
-    out vec3 v_data;
+    layout (location = 0) in vec3 in_vertex;
+    layout (location = 1) in vec3 in_normal;
+    layout (location = 2) in vec3 in_uvw;
+
+    out vec3 v_vertex;
+    out vec3 v_normal;
+    out vec3 v_uvw;
 
     void main() {
-        vec3 v = grass[gl_VertexID];
-        vec4 data = hash41(float(gl_InstanceID));
-        vec2 cell = vec2(float(gl_InstanceID % N), float(gl_InstanceID / N));
-        float height = (sin(cell.x * 0.1) + cos(cell.y * 0.1)) * 0.2;
-        float scale = 0.9 + hash11(float(gl_InstanceID)) * 0.2;
-        data.xy = (data.xy + cell - float(N / 2)) * 0.1;
-        data.z *= 6.283184;
-        vec3 vert = vec3(
-            data.x + cos(data.z) * v.x + sin(data.z) * v.y,
-            data.y + cos(data.z) * v.y - sin(data.z) * v.x,
-            height + v.z
-        );
-        vert *= scale;
-        gl_Position = camera * vec4(vert, 1.0);
-        float dead = step(0.97, hash11(float(gl_InstanceID) + 17.0));
-        v_data = vec3(data.w, v.z, dead);
+        gl_Position = camera * vec4(in_vertex, 1.0);
+        v_vertex = in_vertex;
+        v_normal = in_normal;
+        v_uvw = in_uvw;
     }
 '''
 
-ctx.shaders['grass.frag'] = '''
+ctx.shaders['mesh.frag'] = '''
     #version 330 core
 
-    in vec3 v_data;
+    uniform sampler2DArray Texture;
+
+    in vec3 v_vertex;
+    in vec3 v_normal;
+    in vec3 v_uvw;
 
     layout (location = 0) out vec4 out_color;
 
     void main() {
-        vec3 yl = pow(vec3(0.85, 0.82, 0.2), vec3(2.2));
-        vec3 gn = pow(vec3(0.12, 0.45, 0.1), vec3(2.2));
-        vec3 color = mix(yl, gn, v_data.x) * pow(v_data.y, 3.5) * (1.0 - v_data.z * 0.5);
-        out_color = vec4(pow(color, vec3(1.0 / 2.2)), 1.0);
+        vec3 light = normalize(vec3(0.3, -0.6, 1.0));
+        float lum = 0.55 + 0.45 * max(dot(normalize(v_normal), light), 0.0);
+        vec3 color = texture(Texture, v_uvw).rgb * lum;
+        float fog = smoothstep(12.0, 30.0, length(v_vertex.xy));
+        out_color = vec4(mix(color, vec3(0.05), fog), 1.0);
     }
 '''
 
 uniform_buffer = ctx.buffer(size=64)
+vertex_buffer = ctx.buffer(size=toys.vertices * 36)
 
 ctx.screen.clear_color = (0.05, 0.05, 0.05, 1.0)
 
 pipeline = ctx.pipeline(
-    'grass.vert',
-    'grass.frag',
+    'mesh.vert',
+    'mesh.frag',
+    samplers={'Texture': 0},
     uniform_buffers={'Common': 0},
-    uniforms={'N': 'int', 'grass': 'vec3[15]'},
-    vertex_array=ctx.empty_vertex_array,
-    vertices=15,
-    mode='triangle_strip',
+    vertex_array=ctx.vertex_array(vertex_buffer.bind('3f 3f 3f', 0, 1, 2), vertices=toys.vertices),
     framebuffer=ctx.screen,
-    resources=ctx.resources(uniform_buffers={0: uniform_buffer}),
-    instances=count * count,
+    resources=ctx.resources(samplers={0: ctx.sampler(texture)}, uniform_buffers={0: uniform_buffer}),
     depth_test=True,
+    cull_face='back',
 )
 
-pipeline['N'] = count
-pipeline['grass'] = blade
+last = 0.0
 
 
 def render(timestamp):
+    global last
     if canvas.style.display == 'none':
         canvas.style.display = ''
     ratio = min(js.window.devicePixelRatio, 2.0)
@@ -114,10 +142,24 @@ def render(timestamp):
     if size != ctx.screen.size:
         canvas.width, canvas.height = size
         ctx.screen.size = size
-    yaw = timestamp / 1000.0 * 0.2
-    pitch = 0.32
-    eye = (math.cos(yaw) * math.cos(pitch) * 12.65, math.sin(yaw) * math.cos(pitch) * 12.65, math.sin(pitch) * 12.65)
-    uniform_buffer.write((glm.perspective(math.radians(45.0), size[0] / size[1], 0.1, 1000.0) * glm.lookAt(eye, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0))).to_bytes())
+    dt = min((timestamp - last) / 1000.0, 0.1) if last else 0.0
+    last = timestamp
+
+    aspect = size[0] / size[1]
+    distance = max(7.0 / (math.tan(math.radians(22.5)) * aspect), 10.0)
+    target = glm.vec3(0.0, 0.0, 0.5)
+    eye = target + glm.vec3(0.0, -math.cos(0.45), math.sin(0.45)) * distance
+    camera = glm.perspective(math.radians(45.0), aspect, 0.1, 1000.0) * glm.lookAt(eye, target, glm.vec3(0.0, 0.0, 1.0))
+    inverse = glm.inverse(camera)
+    near = inverse * glm.vec4(pointer['x'], pointer['y'], -1.0, 1.0)
+    far = inverse * glm.vec4(pointer['x'], pointer['y'], 1.0, 1.0)
+    origin = near.xyz / near.w
+    direction = glm.normalize(far.xyz / far.w - origin)
+
+    toys.update(dt, tuple(origin), tuple(direction), pointer['pressed'])
+    vertex_buffer.write(toys.mesh())
+    uniform_buffer.write(camera.to_bytes())
+
     ctx.start_frame()
     ctx.screen.clear()
     pipeline.run()
